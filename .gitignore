@@ -1,0 +1,10 @@
+checkpoints/*
+profiling/*
+tlens_backup/*
+log_train_owt_10k.txt
+mtp.ipynb
+data/open_web_text_10k/*
+data/tiny_shakespeare/*
+data/__pycache__/*
+model/__pycache__/*
+transformer_lens/__pycache__/*
