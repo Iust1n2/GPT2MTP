@@ -10,8 +10,8 @@ class DatasetConfig():
     """Configuration for the dataset."""
     data_dir: str = None
     split: str = None
-    batch_size: int = 32
-    block_size: int = 124  # block_size + n_future ≤ max_context_length (1024 for all GPT-2's // 8)
+    batch_size: int = 16
+    block_size: int = 256  # block_size + n_future ≤ max_context_length (1024 for all GPT-2's // 8)
     n_future: int = 4
     device : str = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -27,15 +27,9 @@ class OpenWebTextDataset(Dataset):
             n_future (int): Number of future tokens to predict (target is shifted by this amount).
         """
         self.args = args
+        self.block_size = args.block_size - args.n_future
         assert split in ['train', 'val'], "split must be 'train' or 'val'"
         assert self.args.n_future >= 1, "n_future must be at least 1"
-
-        # Load vocabulary and meta information
-        meta_path = os.path.join(self.args.data_dir, 'train_meta.pkl')
-        with open(meta_path, 'rb') as f:
-            meta = pickle.load(f)
-        self.stoi, self.itos = meta['stoi'], meta['itos']
-        self.vocab_size = meta['vocab_size']
 
         # Load binary token data with memory mapping
         data_path = os.path.join(self.args.data_dir, f'{split}.bin')
@@ -69,7 +63,7 @@ class OpenWebTextDataset(Dataset):
             data = np.memmap(os.path.join(self.args.data_dir, 'val.bin'), dtype=np.uint16, mode='r')
         ix = torch.randint(len(data) - self.args.block_size, (self.args.batch_size,))
         x = torch.stack([torch.from_numpy((self.data[i:i + self.args.block_size]).astype(np.int64)) for i in ix])
-        y = torch.stack([torch.from_numpy((self.data[i + self.args.n_future:i + self.args.n_future + self.args.block_size]).astype(np.int64)) for i in ix])
+        y = torch.stack([torch.from_numpy((self.data[i + 1:i + 1 + self.args.block_size]).astype(np.int64)) for i in ix])
         if self.args.device == 'cuda':
             device = self.args.device
             # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
@@ -77,3 +71,12 @@ class OpenWebTextDataset(Dataset):
         else:
             x, y = x.to(device), y.to(device)
         return x, y
+
+if __name__ == '__main__':
+    args = DatasetConfig(data_dir='data/open_web_text_10k', split='train')
+    dataset = OpenWebTextDataset(args, 'train')
+    effective_bsz = 32 * 96 * 124 # batch size * gradient_accumulation_steps * block_size
+    print(f"Tokens in dataset: {len(dataset) / 1e6:.2f}M")
+    print(f"Tokens seen per effective optimization step: {effective_bsz}")
+    print(f"Effective steps to see all tokens: {len(dataset) / effective_bsz:.2f}")
+    
