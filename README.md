@@ -1,5 +1,21 @@
 # GPT2MTP
 
+This code supports an implementation of the causal variant of Multi-Token-Prediction as described in the [paper](https://arxiv.org/pdf/2404.19737) by Gloeckle et al. in Appendix B. Alternative Architectures. For a visual explanation of the forward/backward implementation check Figure S11. 
+
+"In a *causal variant*, later prediction heads are applied on top of the previous ones". To achieve this we need to have this line in the MTP loop: 
+
+```
+for i in reversed(range(model.n_future)): 
+    # calculate logits and loss 
+    # ...
+
+    # accumulate gradients in the shared trunk *d.grad* and retain the 
+    loss_i.backward(retain_graph=(i > 0)) 
+
+# backward the accumulated gradient in the rest of the parameters 
+z.backward(d.grad) 
+```
+
 To train the model run the following CLI command: 
 
 ```
@@ -45,6 +61,7 @@ python train.py \
 
 - https://pytorch.org/docs/stable/torch.compiler_profiling_torch_compile.html
 - https://pytorch.org/tutorials/recipes/recipes/profiler_recipe.html
+- https://pytorch.org/tutorials/intermediate/tensorboard_profiler_tutorial.html
 
 The following save a trace of the forward pass through the mtp heads in a json that can be loaded at `chrome://tracing`: 
 ```

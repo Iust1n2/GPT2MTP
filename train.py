@@ -23,6 +23,7 @@ from transformers import get_cosine_schedule_with_warmup
 from train_utils import (
     save_checkpoint,
     plot_grad_flow, 
+    log_acts_and_grads,
     compute_ngram_accuracy
 )
 
@@ -106,7 +107,7 @@ if __name__ == "__main__":
     os.makedirs(profile_dir, exist_ok=True)
 
     tokens_per_step = args.gradient_accumulation_steps * args.batch_size * args.dataset_config.block_size
-    print(f"Tokens per step will be: {tokens_per_step:,}")
+    logging.info(f"Tokens per step will be: {tokens_per_step:,}")
 
     step = 0
     best_val_loss = 1e9
@@ -116,10 +117,10 @@ if __name__ == "__main__":
         model.init_weights()
     elif args.init_from == 'resume':
         logging.info(f"Resuming training from {args.save_dir}")
-        ckpt_path = os.path.join(args.save_dir, 'checkpoint_step.pt')
+        ckpt_path = os.path.join(args.save_dir, 'checkpoint_step_800.pt') # Load a preferred checkpoint
         ckpt = torch.load(ckpt_path, map_location=args.model_config.device)
-        ckpt_model_args = ckpt['model_args']
-        model = GPT2MTP(config=ckpt_model_args, n_future=args.n_future).to(args.model_config.device)
+        # ckpt_model_args = ckpt['model_args']
+        model = GPT2MTP(config=args.model_config, n_future=args.n_future).to(args.model_config.device)
         state_dict = ckpt['model']
         unwanted_prefix = '_orig_mod.'
         for k,v in list(state_dict.items()):
@@ -144,6 +145,7 @@ if __name__ == "__main__":
         model = torch.compile(model)
         logging.info("Compilation complete.")
 
+    # learning rate decay scheduler (cosine with warmup)
     def get_lr(it):
         # 1) Linear warmup: ramp up from 0 to max_lr.
         if it < args.warmup_steps:
@@ -182,6 +184,9 @@ if __name__ == "__main__":
     history, token_history = [], []
     t0 = time.time()
     
+    if args.init_from == 'resume':
+        token_history = ckpt['history']['tokens_seen']
+        
     # Get the first batch
     X, y = train_dataset.get_batch('train') 
 
@@ -213,8 +218,6 @@ if __name__ == "__main__":
         ]
         # Gradient accumulation loop 16 (batch_size) * (64) (gradient_accumulation_steps) = 1024 effective batch_size per optimizer step 
         # tokens per effective batch = 524,288
-        # pbar = tqdm(range(args.gradient_accumulation_steps), desc=f"Step {step}/{args.max_iters}")
-        # for micro_step in pbar:
         total_loss_accum = 0.0
         logging.info(f"Entering gradient accumulation loop for step {step}")
         for micro_step in range(args.gradient_accumulation_steps):
@@ -222,11 +225,11 @@ if __name__ == "__main__":
             micro_loss = 0.0
             head_losses = {}
     
-            # (Optional) Save token history for logging:
+            # Save token history:
             token_history.extend(X.flatten().tolist())
-
-            prompt_len = X.shape[1] - model.n_future  # How much of X is prompt
-            target_len = model.n_future  # How many tokens to predict         
+            
+            # We subtract n_future from the sequence length to match the causal MTP setting 
+            prompt_len = X.shape[1] - model.n_future 
 
             # 2. Run the shared trunk once with autocast
             with ctx:
@@ -235,8 +238,10 @@ if __name__ == "__main__":
             # 3. Detach z and set requires_grad so gradients from heads are collected.
             d = z.detach().clone()
             d.requires_grad = True
-            # 4. For each MTP head, compute the output and loss and accumulate their gradients wrt *their* loss in d.grad of the shared trunk z
-            for i in range(model.n_future):
+
+            # 4. For each MTP head, compute the output and loss and accumulate their gradients wrt to *their* loss in d.grad of the shared trunk z
+            # for i in range(model.n_future): # anti-causal
+            for i in reversed(range(model.n_future)): # causal
                 with ctx:
                     # 3. Compute the output of the trunk
                     # Forward pass through the MTP head to get the projected residual stream vector and hook it
@@ -245,14 +250,9 @@ if __name__ == "__main__":
                     # Unembed the output of the MTP head
                     head_logits = model.unembed(mtp_resid_post)   # (batch, seq_length, vocab_size)
 
-                    # Calculate valid length based on head offset (prevent index overflow)
-                    valid_length = head_logits.size(1) - (i + 1)
-                    if valid_length <= 0:
-                        continue  # Skip if no valid target positions are available
-
-                    # Align logits and targets                    
-                    logits_i = head_logits[:, prompt_len-1 : prompt_len-1+target_len, :]
-                    targets_i = y[:, prompt_len : prompt_len+target_len]
+                    # Align logits and targets for causal prediction
+                    logits_i = head_logits[:, prompt_len - 1 + i, :]  # Predict token at (prompt_len + i)
+                    targets_i = y[:, prompt_len + i]
 
                     # Check target range
                     vocab_size = logits_i.size(-1)
@@ -269,17 +269,18 @@ if __name__ == "__main__":
                 # scale the loss to account for gradient accumulation
                 loss_i_scaled = loss_i / args.gradient_accumulation_steps
                 micro_loss += loss_i_scaled.detach()
-
+                head_losses[f'step_{step}_micro_step_{micro_step}_head_{i}'] = loss_i_scaled.item()
+                
                 # 6. Backward for this head.
                 # Retain the computational graph if more heads will be processed.
-                scaler.scale(loss_i_scaled).backward(retain_graph=(i < args.n_future - 1))
-                
+                # scaler.scale(loss_i_scaled).backward(retain_graph=(i < args.n_future - 1)) # anti-causal
+                scaler.scale(loss_i_scaled).backward(retain_graph=(i > 0)) # causal
+
                 # Print the gradient norm for this head
                 if d.grad is not None:
                     grad_norm = d.grad.norm().item()
                     if micro_step % args.gradient_accumulation_steps == 0:
                         logging.info(f"Final Micro-step {micro_step + args.gradient_accumulation_steps}, Gradient norm for MTP head {i + 1}: {grad_norm:.4f}, Head Loss: {loss_i_scaled.item():.4f}")
-                        head_losses[f'step_{step}_micro_step_{micro_step}_head_{i}'] = loss_i_scaled.item()
                 else:
                     print(f"Warning: d.grad is None after backward pass of head {i + 1}")
                 # Free memory
@@ -294,17 +295,19 @@ if __name__ == "__main__":
         # 7. Propagate accumulated gradients through the trunk
         if d.grad is not None:
             z.backward(d.grad)
-            logging.info(f"Final gradient norm after all heads: {d.grad.norm().item():.4f}, Total Loss: {total_loss_accum.item():.4f}, Average Loss: {((total_loss_accum / args.n_future)).item():.4f}")
+            logging.info(f"Final accum gradient norm after all heads: {d.grad.norm().item():.4f}, Total Loss: {total_loss_accum.item():.4f}, Average Loss: {((total_loss_accum / args.n_future)).item():.4f}")
         else:
             raise ValueError("d.grad is None. Ensure loss.backward() was called.")
                 
+        # Log gradients before clipping
+        if step % args.log_interval == 0:
+            plot_grad_flow(cache, grads_for_vis, step)
+            log_acts_and_grads(cache, step)
+        
         # 8. Gradient clipping
         if args.grad_clip > 0:
             scaler.unscale_(optimizer)
             norm = clip_grad_norm_(model.parameters(), args.grad_clip) # norm = accumulated gradient norm *before* clipping
-        
-        if step % args.log_interval == 0:
-            plot_grad_flow(cache, grads_for_vis, step)
 
         # 9. Optimizer step  
         scaler.step(optimizer)
@@ -326,7 +329,8 @@ if __name__ == "__main__":
                 'step': step,
                 'loss': average_loss_per_token.item(),
                 'lr': lr,
-                'head_losses': head_losses
+                'head_losses': head_losses,
+                'tokens_seen': len(token_history),
             }
         if step % args.eval_iters == 0:
             y_bigram = y[:, :1]  
@@ -335,11 +339,13 @@ if __name__ == "__main__":
                 
             # Compute n-gram accuracies
             with torch.no_grad():
-                # get the logits on the final position
-                logits = model.forward(X)[:, -1, :, :]  #  shape: (batch, n_future, vocab_size)
-                pred_token_ids = torch.argmax(logits, dim=-1)  # shape: (total_batch, target_len)
-                predicted_future_toks = model.to_string(pred_token_ids)
-                target_future_toks = model.to_string(y[:, :args.n_future])
+                logits = model.forward(X)[:, -1, :, :]  # (batch, n_future, vocab_size)
+                pred_token_ids = torch.argmax(logits, dim=-1)  # (batch, n_future)
+                predicted_future_toks = [model.tokenizer.batch_decode(tok_seq) for tok_seq in pred_token_ids]
+                target_future_toks = [model.tokenizer.batch_decode(tgt_seq[:args.n_future]) for tgt_seq in y]
+
+            for predicted_tokens, target_tokens in zip(predicted_future_toks, target_future_toks):
+                logging.info(f"Predicted n-gram: {predicted_tokens}, Target n-gram: {target_tokens}")
 
             # Extract n-grams
             pred_bigrams = pred_token_ids[:, :1] 
@@ -351,9 +357,6 @@ if __name__ == "__main__":
             # pred_trigrams = [tuple(pred_token_ids[:, i : i+2].tolist()) for i in range(pred_token_ids.shape[1] - 2)]
             # pred_fourgrams = [tuple(pred_token_ids[:, i : i+3].tolist()) for i in range(pred_token_ids.shape[1] - 3)]
 
-            for predicted_tokens, target_tokens in zip(predicted_future_toks, target_future_toks):
-                logging.info(f"Predicted 4gram: {predicted_tokens}, Target 4gram: {target_tokens}")
-            
             if args.eval_ngrams and bigrams_cond is not None:
                 # Compute n-gram accuracies using your provided functions.
                 correct_2, total_2 = compute_ngram_accuracy(2, pred_bigrams, y_bigram, bigrams_cond)

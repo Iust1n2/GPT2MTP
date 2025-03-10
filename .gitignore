@@ -3,9 +3,7 @@ grad_flow/*
 checkpoints/*
 profiling/*
 tlens_backup/*
-log_train_owt_10k.txt
-log_train_owt.txt
-log_train_owt_old.txt
+logs/*
 mtp.ipynb
 data/open_web_text_10k/*
 data/open_web_text/*

@@ -55,7 +55,7 @@ class Output(NamedTuple):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, config: GPT2MTPConfig, add_mtp_heads: bool = False, n_future: int = 4):
+    def __init__(self, config: GPT2MTPConfig):
         super().__init__()
         self.cfg = config
         self.ln1 = LayerNorm(self.cfg)

@@ -141,3 +141,49 @@ def plot_grad_flow(cache, regex_filters=None, step=None, save=True):
     else: 
         plt.show()
     plt.close()
+
+def log_acts_and_grads(cache, step):
+    log_dir_activations = f"grad_flow/activations/log_step_{step}"
+    log_dir_gradients = f"grad_flow/gradients/log_step_{step}"
+    os.makedirs(log_dir_activations, exist_ok=True)
+    os.makedirs(log_dir_gradients, exist_ok=True)
+
+    # Compile regex pattern for gradients only
+    regex_pattern = r'.*_grad$'
+    grad_pattern = re.compile(regex_pattern)
+
+    activations_log_entries = []
+    gradients_log_entries = []
+
+    for i, n in enumerate(cache):
+        p = cache[n]
+        if p is not None:
+            p_np = p.float().detach().cpu().numpy()
+            p_np_norm = float(torch.norm(p.float(), p=2).detach().cpu())
+
+            # Check if it's a gradient using regex
+            if grad_pattern.match(n):
+                # Format the gradient log entry with actual values
+                grad_entry = f"{n}: mean={p_np.mean()}, max={p_np.max()}, norm={p_np_norm:.6f}"
+                gradients_log_entries.append(grad_entry)
+            else:
+                # Format the activation log entry
+                activation_entry = f"{n}: mean={p_np.mean()}, max={p_np.max()}, norm={p_np_norm:.6f}"
+                activations_log_entries.append(activation_entry)
+        else:
+            # Explicitly log None values
+            if grad_pattern.match(n):
+                gradients_log_entries.append(f"{n}: None")
+            else:
+                activations_log_entries.append(f"{n}: None")
+
+    # Write all activation entries to the log file
+    activation_log_file = os.path.join(log_dir_activations, "activations_log.txt")
+    with open(activation_log_file, "a") as f:
+        f.write("\n".join(activations_log_entries) + "\n")
+
+    # Write all gradient entries to the log file
+    gradient_log_file = os.path.join(log_dir_gradients, "gradients_log.txt")
+    with open(gradient_log_file, "a") as f:
+        f.write("\n".join(gradients_log_entries) + "\n")
+
