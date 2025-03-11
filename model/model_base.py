@@ -53,7 +53,6 @@ class Output(NamedTuple):
     loss: Loss
     attention_mask: Optional[Int[torch.Tensor, "batch pos"]]
 
-
 class TransformerBlock(nn.Module):
     def __init__(self, config: GPT2MTPConfig):
         super().__init__()
@@ -238,8 +237,8 @@ class GPT2MTP(HookedRootModule):
         ],
         targets: Optional[Int[torch.Tensor, "batch pos + n_future"]] = None,
         return_type: Optional[str] = "logits",
-        # return_all_heads: bool = False,
-        loss_type: str = "multi_token",
+        return_all_heads: bool = True,
+        loss_type: Optional[Literal["multi_token", "single_token"]] = "multi_token",
         loss_per_token: bool = False,
         prepend_bos: Optional[Union[bool, None]] = None,
         padding_side: Optional[Literal["left", "right"]] = None,
@@ -301,16 +300,18 @@ class GPT2MTP(HookedRootModule):
             # We retrieve the shared trunk output from the final block before the MTP heads start.
             return residual
         
-        if self.mtp_heads is not None:
-            mtp_outputs = []
-            # Compute outputs for each of the n_future MTP heads.
-            for i, head in enumerate(self.mtp_heads):
-                mtp_head = self.hook_mtp_heads[i](head(residual))
-                mtp_outputs.append(mtp_head)    
-            # Stack the outputs along a new dimension (n_future)
-            stacked_pre = self.hook_mtp_heads_out_pre(torch.stack(mtp_outputs, dim=-2))  # (batch, pos, n_future, d_model)
-            # Pass the stacked tensor through a LayerNorm.
-            stacked_norm = self.hook_mtp_heads_out_post(self.ln_f(stacked_pre))  # (batch, pos, n_future, d_model)
+        # MTP Prediction Heads
+        n_mtp_heads = self.n_future if return_all_heads else 1
+        # if self.mtp_heads is not None and return_all_heads:
+        mtp_outputs = []
+        # Compute outputs for each of the n_future MTP heads.
+        for i, head in enumerate(self.mtp_heads[:n_mtp_heads]):
+            mtp_head = self.hook_mtp_heads[i](head(residual))
+            mtp_outputs.append(mtp_head)    
+        # Stack the outputs along a new dimension (n_future)
+        stacked_pre = self.hook_mtp_heads_out_pre(torch.stack(mtp_outputs, dim=-2))  # (batch, pos, n_future, d_model)
+        # Pass the stacked tensor through a LayerNorm.
+        stacked_norm = self.hook_mtp_heads_out_post(self.ln_f(stacked_pre))  # (batch, pos, n_future, d_model)
         # Map the hooked output to vocabulary logits using the shared unembedding layer
         logits = self.hook_unembed(self.unembed(stacked_norm))  # Shape: (batch, seq, n_future, vocab_size)
         # Compute cross-entropy loss for each future token prediction.
@@ -322,7 +323,7 @@ class GPT2MTP(HookedRootModule):
             ), "tokens must be passed in if return_type is 'loss' or 'both'"
             if loss_type == "multi_token":
                 loss = self.loss_fn(logits, targets, attention_mask, per_token=loss_per_token, loss_type=loss_type)
-            else: 
+            elif loss_type == "single_token": 
                 loss = self.loss_fn(logits, targets, attention_mask, per_token=loss_per_token, loss_type='single_token')
             if return_type == "loss":
                 return loss
@@ -762,7 +763,7 @@ class GPT2MTP(HookedRootModule):
             if do_sample and temperature > 0:
                 # Compute probabilities with temperature scaling.
                 probs = torch.softmax(logits / temperature, dim=-1)
-                # Use nucleus (top-p) sampling (assume sample_top_p is implemented)
+                # Use nucleus (top-p) sampling to select the next token.
                 next_token = sample_top_p(probs, top_p)
             else:
                 next_token = torch.argmax(logits, dim=-1)
