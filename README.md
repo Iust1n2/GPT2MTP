@@ -1,9 +1,10 @@
 # GPT2MTP
 
-This code supports an implementation of the causal variant of Multi-Token-Prediction as described in the [paper](https://arxiv.org/pdf/2404.19737) by Gloeckle et al. in Appendix B. Alternative Architectures. For a visual explanation of the forward/backward implementation check Figure S11. 
+This code supports an implementation of the causal variant of Multi-Token-Prediction as described in the [paper](https://arxiv.org/pdf/2404.19737) by Gloeckle et al. (Appendix B. Alternative Architectures).  For a visual explanation of the forward/backward implementation check Figure S11 below. 
 
-"In a *causal variant*, later prediction heads are applied on top of the previous ones". To achieve this we need to have this line in the MTP loop: 
+![Figure S11](images/MTP_Causal.png)
 
+To achieve this we need to have this line in the MTP loop: 
 ```
 for i in reversed(range(model.n_future)): 
     # calculate logits and loss 
@@ -16,37 +17,36 @@ for i in reversed(range(model.n_future)):
 z.backward(d.grad) 
 ```
 
-To train the model run the following CLI command: 
+More about the [`retain_graph`](https://stackoverflow.com/questions/46774641/what-does-the-parameter-retain-graph-mean-in-the-variables-backward-method) argument in the backward pass.
 
+## HookedGPT2MTP
+
+The GPT2MTP is built upon the `HookedTransformer` class from the [TransformerLens](https://transformerlensorg.github.io/TransformerLens/) library such that we can access intermediate activations in the Transformer and more important the MTP heads' activations. For that we slightly modified the `setup()` method of the `HookedRootModule` class in `hook_points.py` in order to identify and setup forward hooks on the MTP heads which are conveniently named `hook_mtp_heads.i` (where `i` is the number of MTP heads) for individual MTP activations and `hook_mtp_heads_out_pre` and `hook_mtp_heads_out_post` for the stacked tensor of MTP predictions pre/post LayerNorm.
+
+Add the following line at the end of the `setup()` function in `HookedRootModule`: 
 ```
-python train.py \
-    n_future=4 \
-    batch_size=32 \
-    gradient_accumulation_steps=$((2 * 16)) \
-    max_iters=10850 \
-    lr_decay_iters=10850 \
-    max_lr=3e-4 \
-    decay_lr=True \
-    warmup_steps=1000 \
-    min_lr=1e-5 \
-    weight_decay=0.1 \
-    betas="[0.9, 0.95]" \
-    grad_clip=1.0 \
-    log_interval=1 \
-    init_from="scratch" \
-    data_dir="data/open_web_text/" \
-    save_dir="checkpoints/open_web_text/" \
-    always_save_checkpoint=False \
-    eval_only=False \
-    eval_interval=100 \
-    eval_ngrams=False \
-    eval_iters=200 \
-    device="cuda" \
-    dtype="bfloat16" \
-    compile=True > log_train_owt.txt
+# Recursively call setup_hooks if the torch module has it
+if hasattr(module, "setup_hooks"):
+    module.setup_hooks(name)
 ```
 
-## PyTorch utilities for training
+## Setup
+
+To download the dataset run: 
+
+```
+python data/open_web_text.py
+```
+
+## Train
+
+To train the model with the GPT-2 Small configuration (with a slightly lower contex length of 256) and 4 MTP prediction heads run the following CLI command: 
+
+```
+python train.py > log_train_owt.txt 2>&1
+```
+
+<details><summary>PyTorch utilities for training</summary>
 
 1. Mixed Precision Training: 
 
@@ -75,3 +75,14 @@ prof2.export_chrome_trace(f"{profile_dir}/trace_fwd_mtp.json")
 or just inline print table with: 
 
 `print(prof2.key_averages().table(sort_by=sort_by_keyword, row_limit=10))`
+
+</details>
+
+## TODO: 
+
+- [ ... ] Standard weight init (He or Xavier): 
+    - https://www.deeplearning.ai/ai-notes/initialization/index.html
+    - [Xavier](https://pytorch.org/docs/stable/nn.init.html#torch.nn.init.xavier_uniform_) 
+    - [Kaiming](https://pytorch.org/docs/stable/nn.init.html#torch.nn.init.kaiming_uniform_) 
+- [ ... ] How to tune [AdamW](https://arxiv.org/pdf/1711.05101) optimizer parameters (`max_lr`, `betas`, `weight_decay`) and [Cosine](https://pytorch.org/torchtune/0.3/generated/torchtune.modules.get_cosine_schedule_with_warmup.html) with [warmup](https://arxiv.org/pdf/1608.03983) Scheduler (`warmup_iters`) 
+- [ X ] Update the forward pass for a manual bool kwarg for `return_all_mtp_heads`. If `True` keep the stacked tensor, if `False` keep only one head. look at https://huggingface.co/facebook/multi-token-prediction/blob/main/llama/model.py

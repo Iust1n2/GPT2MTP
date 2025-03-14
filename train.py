@@ -4,12 +4,10 @@ from pathlib import Path
 import logging
 import pickle
 import time
-from tqdm import tqdm
-from omegaconf import OmegaConf
 from contextlib import nullcontext
 
+import gc
 import re
-import math
 import torch
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
@@ -35,7 +33,7 @@ class TrainingArgs:
     dataset_config : DatasetConfig
     data_dir : str = 'data/open_web_text/'  
     save_dir : str = 'checkpoints/open_web_text/'
-    init_from : str = 'scratch' # or 'resume'
+    init_from : str = 'resume' # or 'resume'
     always_save_checkpoint : bool = True
     eval_only : bool = False 
     eval_interval : int = 400
@@ -49,11 +47,11 @@ class TrainingArgs:
     max_lr : float = 3e-4 
     decay_lr : bool = True
     warmup_steps : int = 1000
-    min_lr : float = 1e-5
-    weight_decay : float = 0.03
+    min_lr : float = 3e-5
+    weight_decay : float = 0.1 # reduce from 0.03 to 0.01 if residual stream gradients begin to vanish in deeper layers or overall smaller than mtp heads
     betas : tuple = (0.9, 0.95)
-    grad_clip : float = 1.0
-    log_interval : int = 50
+    grad_clip : float = 1.0 # increase to 1.5 if mtp heads gradients start exploding
+    log_interval : int = 200
     device : str = 'cuda' 
     dtype : str = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
     compile : bool = True
@@ -65,14 +63,7 @@ if __name__ == "__main__":
         dataset_config = DatasetConfig(data_dir='data/open_web_text/', split='train'),
     )
     logging.info(f"Training with args: {args}")
-    config_path = 'train_config.yaml'  
-    file_cfg = OmegaConf.load(config_path)
 
-    # # Merge CLI args with YAML and defaults
-    # cfg = OmegaConf.merge(OmegaConf.structured(args), file_cfg, OmegaConf.from_cli())
-
-    # print(OmegaConf.to_yaml(cfg))  # Print merged config for debugging
-    
     if args.save_dir is not None:
         outdir = Path('') / Path(args.save_dir)
         outdir.mkdir(parents=True, exist_ok=True)
@@ -116,10 +107,9 @@ if __name__ == "__main__":
         model = GPT2MTP(config=args.model_config, n_future=args.n_future).to(args.model_config.device) 
         model.init_weights()
     elif args.init_from == 'resume':
-        logging.info(f"Resuming training from {args.save_dir}")
         ckpt_path = os.path.join(args.save_dir, 'checkpoint_step_800.pt') # Load a preferred checkpoint
+        logging.info(f"Resuming training from {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=args.model_config.device)
-        # ckpt_model_args = ckpt['model_args']
         model = GPT2MTP(config=args.model_config, n_future=args.n_future).to(args.model_config.device)
         state_dict = ckpt['model']
         unwanted_prefix = '_orig_mod.'
@@ -138,6 +128,8 @@ if __name__ == "__main__":
     if args.init_from == 'resume':
         optimizer.load_state_dict(ckpt['optimizer'])
         scheduler.load_state_dict(ckpt['scheduler'])
+        current_lr = optimizer.param_groups[0]['lr']
+        logging.info(f"Resumed Training - Step {step}, Learning Rate: {current_lr:.8f}")
     
     if args.compile: 
         logging.info("Compiling the model... (takes a ~minute)")
@@ -145,26 +137,6 @@ if __name__ == "__main__":
         model = torch.compile(model)
         logging.info("Compilation complete.")
 
-    # learning rate decay scheduler (cosine with warmup)
-    def get_lr(it):
-        # 1) Linear warmup: ramp up from 0 to max_lr.
-        if it < args.warmup_steps:
-            return args.max_lr * (it + 1) / (args.warmup_steps + 1)
-        
-        # 2) After lr_decay_iters, fix the learning rate to 3% of max_lr.
-        if it > args.lr_decay_iters:
-            return args.max_lr * args.weight_decay
-        
-        # 3) In between, use cosine decay to schedule the learning rate.
-        # Calculate progress through the decay phase (0 to 1)
-        progress = (it - args.warmup_steps) / (args.lr_decay_iters - args.warmup_steps)
-        # Cosine coefficient goes from 1 to 0
-        coeff = 0.5 * (1.0 + math.cos(math.pi * progress))
-        # The target final learning rate is 3% of max_lr.
-        final_lr = args.max_lr * args.weight_decay
-        # Return a learning rate that decays from max_lr to final_lr.
-        return final_lr + coeff * (args.max_lr - final_lr)
-    
     # Helps estimate an arbitrarily accurate loss over either split using many batches
     @torch.no_grad()
     def estimate_loss():
@@ -185,30 +157,22 @@ if __name__ == "__main__":
     t0 = time.time()
     
     if args.init_from == 'resume':
-        token_history = ckpt['history']['tokens_seen']
+        history = ckpt['history']
+        tokens_seen = history[-1]['tokens_seen']
+        if isinstance(tokens_seen, list):
+            token_history = tokens_seen
+        else:
+            token_history.append(tokens_seen)
         
     # Get the first batch
     X, y = train_dataset.get_batch('train') 
 
     # Training loop
     while step < args.max_iters:
-        logging.info(f"Step {step}")
-        lr = get_lr(step) if args.decay_lr else args.max_lr
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+        # Get the current learning rate (either restored or new)
+        current_lr = optimizer.param_groups[0]['lr']
+        logging.info(f"Step {step}, Learning Rate: {current_lr}")
     
-        # Evaluate the loss on train/val sets and write checkpoints
-        if step % args.eval_interval == 0:
-            losses = estimate_loss()
-            logging.info(f"Eval Step {step}: Train Loss {losses['train']:.4f}, Val Loss {losses['val']:.4f}")
-            if losses['val'] < best_val_loss or args.always_save_checkpoint:
-                best_val_loss = losses['val']
-                save_checkpoint(args.save_dir, model, optimizer, scheduler, step, best_val_loss, history)
-        
-        # Do only an eval step
-        if step == 0 and args.eval_only:
-            break
-        
         # Add hooks for caching forward activations 
         all_hook_names = list(model.hook_dict.keys())
         cache = model.add_caching_hooks(names_filter=all_hook_names, incl_bwd=True) 
@@ -216,6 +180,18 @@ if __name__ == "__main__":
             re.compile(r'^(hook_mtp_heads)\.(\d+)_grad$'),
             re.compile(r'^(blocks\.(\d+)\.hook_resid_post)_grad$')
         ]
+        # Evaluate the loss on train/val sets and write checkpoints
+        if step % args.eval_interval == 0:
+            losses = estimate_loss()
+            logging.info(f"Eval Step {step}: Train Loss {losses['train']:.4f}, Val Loss {losses['val']:.4f}")
+            if losses['val'] < best_val_loss or args.always_save_checkpoint:
+                best_val_loss = losses['val']
+                save_checkpoint(args.save_dir, model, optimizer, scheduler, step, best_val_loss, history, cache)
+        
+        # Do only an eval step
+        if step == 0 and args.eval_only:
+            break
+        
         # Gradient accumulation loop 16 (batch_size) * (64) (gradient_accumulation_steps) = 1024 effective batch_size per optimizer step 
         # tokens per effective batch = 524,288
         total_loss_accum = 0.0
@@ -231,7 +207,7 @@ if __name__ == "__main__":
             # We subtract n_future from the sequence length to match the causal MTP setting 
             prompt_len = X.shape[1] - model.n_future 
 
-            # 2. Run the shared trunk once with autocast
+            # 2. Run the forward pass on the shared trunk once with autocast
             with ctx:
                 z = model.shared_trunk(X)  # shape: (batch, seq, d_model)
     
@@ -243,21 +219,15 @@ if __name__ == "__main__":
             # for i in range(model.n_future): # anti-causal
             for i in reversed(range(model.n_future)): # causal
                 with ctx:
-                    # 3. Compute the output of the trunk
-                    # Forward pass through the MTP head to get the projected residual stream vector and hook it
+                    # 3. # Run the forward pass through the furthest MTP head to get the projected residual stream vector and hook it
                     mtp_resid_post = model.hook_mtp_heads[i](model.mtp_heads[i](d))    # (batch, seq_length, d_model)
                 
-                    # Unembed the output of the MTP head
+                    # 4. Unembed the output of the MTP head
                     head_logits = model.unembed(mtp_resid_post)   # (batch, seq_length, vocab_size)
 
                     # Align logits and targets for causal prediction
                     logits_i = head_logits[:, prompt_len - 1 + i, :]  # Predict token at (prompt_len + i)
                     targets_i = y[:, prompt_len + i]
-
-                    # Check target range
-                    vocab_size = logits_i.size(-1)
-                    assert targets_i.min() >= 0, f"Invalid target: min={targets_i.min()}"
-                    assert targets_i.max() < vocab_size, f"Invalid target: max={targets_i.max()} ≥ vocab_size={vocab_size}"
 
                     # 5. Compute cross-entropy loss per head
                     loss_i = F.cross_entropy(
@@ -284,7 +254,8 @@ if __name__ == "__main__":
                 else:
                     print(f"Warning: d.grad is None after backward pass of head {i + 1}")
                 # Free memory
-                del mtp_resid_post, head_logits, logits_i
+                del mtp_resid_post, head_logits, logits_i, loss_i, loss_i_scaled
+                gc.collect()
                 torch.cuda.empty_cache()
 
             # Accumulate the total loss
@@ -313,6 +284,7 @@ if __name__ == "__main__":
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
+        scheduler.step()
 
         t1 = time.time()
         dt = t1 - t0
@@ -328,7 +300,7 @@ if __name__ == "__main__":
         curr_history = {
                 'step': step,
                 'loss': average_loss_per_token.item(),
-                'lr': lr,
+                'lr': current_lr,
                 'head_losses': head_losses,
                 'tokens_seen': len(token_history),
             }
@@ -377,132 +349,5 @@ if __name__ == "__main__":
     
         step += 1
     # Save final checkpoint
-    save_checkpoint(model, optimizer, scheduler, step, args.save_dir, history)
+    save_checkpoint(model, optimizer, scheduler, step, args.save_dir, history, cache)
     logging.info(f"Training complete in {dt:.2f} seconds.") 
- 
-#     # Get the first batch
-# X, y = train_dataset.get_batch('train') 
-
-# # Training loop
-# while step < args.max_iters:
-#     print(f"Step {step}")
-#     lr = get_lr(step) if args.decay_lr else args.max_lr
-#     for param_group in optimizer.param_groups:
-#         param_group['lr'] = lr
-
-#     # Evaluate the loss on train/val sets and write checkpoints
-#     if step % args.eval_interval == 0:
-#         losses = estimate_loss()
-#         print(f"Eval Step {step}: Train Loss {losses['train']:.4f}, Val Loss {losses['val']:.4f}")
-#         if losses['val'] < best_val_loss or args.always_save_checkpoint:
-#             best_val_loss = losses['val']
-#             save_checkpoint(args.save_dir, model, optimizer, scheduler, step, best_val_loss, history)
-    
-#     # Do only an eval step
-#     if step == 0 and args.eval_only:
-#         break
-    
-#     # Add hooks for caching forward activations 
-#     all_hook_names = list(model.hook_dict.keys())
-#     cache = model.add_caching_hooks(names_filter=all_hook_names, incl_bwd=True) 
-#     grads_for_vis = [
-#         re.compile(r'^(hook_mtp_heads)\.(\d+)_grad$'),
-#         re.compile(r'^(blocks\.(\d+)\.hook_resid_post)_grad$')
-#     ]
-#     # Gradient accumulation loop 16 (batch_size) * (64) (gradient_accumulation_steps) = 1024 effective batch_size per optimizer step 
-#     # tokens per effective batch = 524,288
-#     # pbar = tqdm(range(args.gradient_accumulation_steps), desc=f"Step {step}/{args.max_iters}")
-#     # for micro_step in pbar:
-#     print(f"Entering gradient accumulation loop for step {step}")
-#     for micro_step in range(args.gradient_accumulation_steps):
-#         # print(f"Micro-step {micro_step + 1}/{args.gradient_accumulation_steps}")
-#         total_loss = 0.0
-#         head_losses = {}
-
-#         # (Optional) Save token history for logging:
-#         token_history.extend(X.flatten().tolist())
-
-#         prompt_len = X.shape[1] - model.n_future  # How much of X is prompt
-#         target_len = model.n_future  # How many tokens to predict         
-
-#         # 2. Run the shared trunk once with autocast
-#         with ctx:
-#             z = model.shared_trunk(X)  # shape: (batch, seq, d_model)
-
-#         # 3. Detach z and set requires_grad so gradients from heads are collected.
-#         d = z.detach().clone()
-#         d.requires_grad = True
-#         # 4. For each MTP head, compute the output and loss and accumulate their gradients wrt *their* loss in d.grad of the shared trunk z
-#         for i in range(model.n_future):
-#             with ctx:
-#                 # 3. Compute the output of the trunk
-#                 # Forward pass through the MTP head to get the projected residual stream vector and hook it
-#                 mtp_resid_post = model.hook_mtp_heads[i](model.mtp_heads[i](d))    # (batch, seq_length, d_model)
-            
-#                 # Unembed the output of the MTP head
-#                 head_logits = model.unembed(mtp_resid_post)   # (batch, seq_length, vocab_size)
-
-#                 # Calculate valid length based on head offset (prevent index overflow)
-#                 valid_length = head_logits.size(1) - (i + 1)
-#                 if valid_length <= 0:
-#                     continue  # Skip if no valid target positions are available
-
-#                 # Align logits and targets                    
-#                 logits_i = head_logits[:, prompt_len-1 : prompt_len-1+target_len, :]
-#                 targets_i = y[:, prompt_len : prompt_len+target_len]
-
-#                 # Check target range
-#                 vocab_size = logits_i.size(-1)
-#                 assert targets_i.min() >= 0, f"Invalid target: min={targets_i.min()}"
-#                 assert targets_i.max() < vocab_size, f"Invalid target: max={targets_i.max()} ≥ vocab_size={vocab_size}"
-
-#                 # 5. Compute cross-entropy loss per head
-#                 loss_i = F.cross_entropy(
-#                     logits_i.reshape(-1, logits_i.size(-1)),  # (batch * valid_length, vocab_size)
-#                     targets_i.reshape(-1),                    # (batch * valid_length)
-#                     # ignore_index=-1                           # Ignore padding if used
-#                 )
-#             # End autocast before the backward pass
-#             # scale the loss to account for gradient accumulation
-#             loss_i = loss_i / args.gradient_accumulation_steps
-#             total_loss += loss_i.detach()
-
-#             # 6. Backward for this head.
-#             # Retain the computational graph if more heads will be processed.
-#             scaler.scale(loss_i).backward(retain_graph=(i < args.n_future - 1))
-            
-#             # Print the gradient norm for this head
-#             if d.grad is not None:
-#                 grad_norm = d.grad.norm().item()
-#                 if micro_step % args.gradient_accumulation_steps == 0:
-#                     print(f"Final Micro-step {micro_step + args.gradient_accumulation_steps}, Gradient norm for MTP head {i + 1}: {grad_norm:.4f}, Head Loss: {loss_i.item():.4f}")
-#                     head_losses[f'step_{step}_micro_step_{micro_step}_head_{i}'] = loss_i.item()
-#             else:
-#                 print(f"Warning: d.grad is None after backward pass of head {i + 1}")
-#             # Free memory
-#             del mtp_resid_post, head_logits, logits_i
-#             torch.cuda.empty_cache()
-
-#     # prefetch the next batch and define the target n-grams
-#     X, y = train_dataset.get_batch('train')
-
-#     # 7. Propagate accumulated gradients through the trunk
-#     if d.grad is not None:
-#         z.backward(d.grad)
-#         logging.info(f"Final gradient norm after all heads: {d.grad.norm().item():.4f}, Total Loss: {(total_loss * args.gradient_accumulation_steps).item():.4f}, Average Loss: {((total_loss / args.n_future) * args.gradient_accumulation_steps).item():.4f}")
-#     else:
-#         raise ValueError("d.grad is None. Ensure loss.backward() was called.")
-            
-#     # 8. Gradient clipping
-#     if args.grad_clip > 0:
-#         scaler.unscale_(optimizer)
-#         norm = clip_grad_norm_(model.parameters(), args.grad_clip)
-    
-#     if step % args.log_interval == 0:
-#         plot_grad_flow(cache, grads_for_vis, step)
-
-#     # 9. Optimizer step  
-#     scaler.step(optimizer)
-#     scaler.update()
-#     optimizer.zero_grad(set_to_none=True)
-#     step +=1

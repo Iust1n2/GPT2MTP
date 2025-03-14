@@ -3,7 +3,6 @@ import re
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
 
 def compute_ngram_accuracy(ngram, pred_tokens, target_tokens, ngrams_cond):
     correct, total = 0, 0
@@ -22,7 +21,7 @@ def compute_ngram_accuracy(ngram, pred_tokens, target_tokens, ngrams_cond):
 
     return correct, total
 
-def save_checkpoint(save_dir, model, optimizer, scheduler, step, best_val_loss, history):
+def save_checkpoint(save_dir, model, optimizer, scheduler, step, best_val_loss, history, cache):
     """Save model checkpoint."""
     if not os.path.exists(save_dir):
         os.makedirs(save_dir, exist_ok=True)
@@ -33,6 +32,7 @@ def save_checkpoint(save_dir, model, optimizer, scheduler, step, best_val_loss, 
         'step': step,
         'best_val_loss': best_val_loss,
         'history': history,
+        'cache': cache
         # 'config': model.config
     }, os.path.join(save_dir, f'checkpoint_step_{step}.pt'))
 
@@ -164,11 +164,11 @@ def log_acts_and_grads(cache, step):
             # Check if it's a gradient using regex
             if grad_pattern.match(n):
                 # Format the gradient log entry with actual values
-                grad_entry = f"{n}: mean={p_np.mean()}, max={p_np.max()}, norm={p_np_norm:.6f}"
+                grad_entry = f"{n}: mean={p_np.mean()}, max={p_np.max()} std_abs={p_np.std()}, norm={p_np_norm:.6f}"
                 gradients_log_entries.append(grad_entry)
             else:
                 # Format the activation log entry
-                activation_entry = f"{n}: mean={p_np.mean()}, max={p_np.max()}, norm={p_np_norm:.6f}"
+                activation_entry = f"{n}: mean={p_np.mean()}, max={p_np.max()}, std_abs={p_np.std()} norm={p_np_norm:.6f}"
                 activations_log_entries.append(activation_entry)
         else:
             # Explicitly log None values

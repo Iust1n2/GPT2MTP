@@ -1,10 +1,12 @@
 train_config.yaml
 grad_flow/*
+grad_flow_old/*
+grad_flow_uninit_mtp_heads_weight_decay_0.03_beta2_0.95_min_lr_1e-5/*
 checkpoints/*
 profiling/*
 tlens_backup/*
 logs/*
-mtp.ipynb
+notebooks/*
 data/open_web_text_10k/*
 data/open_web_text/*
 data/tiny_shakespeare/*

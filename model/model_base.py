@@ -38,6 +38,13 @@ from transformer_lens.components import (
 )
 import transformer_lens.utils as utils
 
+from transformer_lens.utils import (
+    init_kaiming_normal_,
+    init_kaiming_uniform_,
+    init_xavier_normal_,
+    init_xavier_uniform_,
+)
+
 USE_DEFAULT_VALUE = None
 SingleLoss = Float[torch.Tensor, ""]  # Type alias for a single element tensor
 LossPerToken = Float[torch.Tensor, "batch pos-1"]
@@ -654,11 +661,17 @@ class GPT2MTP(HookedRootModule):
         are initialized to N(0, 0.64/d_model) if initializer_range is not set, otherwise std is initializer_range.
         """
         for name, param in self.named_parameters():
-            if "W_" in name:
+            if not param.requires_grad:
+                continue  # Skip non-trainable parameters
+
+            # Initialize all weights properly
+            if "W_" in name or "mtp_heads" in name or "weight" in name:
                 nn.init.normal_(param, std=self.cfg.initializer_range)
-            elif "b_" in name:
+
+            # Ensure all biases are explicitly set to 0.0
+            elif "b_" in name or "bias" in name:
                 nn.init.constant_(param, 0.0)
-    
+        
     @overload
     def run_with_cache(
         self, *model_args, return_cache_object: Literal[True] = True, **kwargs

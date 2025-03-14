@@ -40,13 +40,8 @@ class OpenWebTextDataset(Dataset):
         return len(self.data) - self.args.batch_size - self.args.n_future + 1
     
     def __getitem__(self, idx):
-        """
-        Returns:
-            x (torch.LongTensor): Input tokens of shape (block_size,)
-            y (torch.LongTensor): Future target tokens shifted by n_future of shape (block_size,)
-        """
-        x = torch.tensor(self.data[idx:idx + self.args.block_size], dtype=torch.long)
-        y = torch.tensor(self.data[idx + self.args.n_future:idx + self.args.n_future + self.args.block_size], dtype=torch.long)    
+        x = torch.from_numpy(self.data[idx:idx + self.block_size].astype(np.int64))
+        y = torch.from_numpy(self.data[idx + 1:idx + 1 + self.block_size].astype(np.int64))
         return x, y
 
     def get_batch(self, split):
