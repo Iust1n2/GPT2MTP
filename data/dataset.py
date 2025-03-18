@@ -1,6 +1,5 @@
 from dataclasses import dataclass
 import os
-import pickle
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -10,8 +9,8 @@ class DatasetConfig():
     """Configuration for the dataset."""
     data_dir: str = None
     split: str = None
-    batch_size: int = 16
-    block_size: int = 256  # block_size + n_future ≤ max_context_length (1024 for all GPT-2's // 8)
+    batch_size: int = 8
+    block_size: int = 512  # block_size + n_future ≤ max_context_length (1024 for all GPT-2's // 8)
     n_future: int = 4
     device : str = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -27,6 +26,7 @@ class OpenWebTextDataset(Dataset):
             n_future (int): Number of future tokens to predict (target is shifted by this amount).
         """
         self.args = args
+        self.batch_size = args.batch_size
         self.block_size = args.block_size - args.n_future
         assert split in ['train', 'val'], "split must be 'train' or 'val'"
         assert self.args.n_future >= 1, "n_future must be at least 1"
@@ -66,6 +66,10 @@ class OpenWebTextDataset(Dataset):
         else:
             x, y = x.to(device), y.to(device)
         return x, y
+    
+    def get_dataloader(self, split):
+        dataset = OpenWebTextDataset(self, split)
+        return DataLoader(dataset, batch_size=self.batch_size, shuffle=True, num_workers=0)
 
 if __name__ == '__main__':
     args = DatasetConfig(data_dir='data/open_web_text_10k', split='train')

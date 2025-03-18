@@ -131,7 +131,7 @@ def plot_grad_flow(cache, regex_filters=None, step=None, save=True):
     plt.grid(True, which="both", linestyle="--", linewidth=0.7)
     # plt.legend()
 
-    save_dir2 = "grad_flow/norm"
+    save_dir2 = "train/train_misc/grad_flow/norm"
     if not os.path.exists(save_dir2):
         os.makedirs(save_dir2)
     plt.tight_layout()
@@ -143,11 +143,13 @@ def plot_grad_flow(cache, regex_filters=None, step=None, save=True):
     plt.close()
 
 def log_acts_and_grads(cache, step):
-    log_dir_activations = f"grad_flow/activations/log_step_{step}"
-    log_dir_gradients = f"grad_flow/gradients/log_step_{step}"
+    save_dir = 'train/train_misc/grad_flow'
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+    log_dir_activations = os.path.join(save_dir, f"activations/log_step_{step}")
+    log_dir_gradients = os.path.join(save_dir, f"gradients/log_step_{step}")
     os.makedirs(log_dir_activations, exist_ok=True)
     os.makedirs(log_dir_gradients, exist_ok=True)
-
     # Compile regex pattern for gradients only
     regex_pattern = r'.*_grad$'
     grad_pattern = re.compile(regex_pattern)

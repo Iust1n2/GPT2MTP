@@ -46,6 +46,8 @@ To train the model with the GPT-2 Small configuration (with a slightly lower con
 python train.py > log_train_owt.txt 2>&1
 ```
 
+1. for 1M /2 tokens per optimization step we can either set `n_ctx` to 256 with `batch_size` of 16 or `n_ctx` of 512 with `batch_size` of 8 and `n_ctx` of 1024 (GPT-2 Small) with `batch_size` of 4.
+
 <details><summary>PyTorch utilities for training</summary>
 
 1. Mixed Precision Training: 
@@ -86,3 +88,13 @@ or just inline print table with:
     - [Kaiming](https://pytorch.org/docs/stable/nn.init.html#torch.nn.init.kaiming_uniform_) 
 - [ ... ] How to tune [AdamW](https://arxiv.org/pdf/1711.05101) optimizer parameters (`max_lr`, `betas`, `weight_decay`) and [Cosine](https://pytorch.org/torchtune/0.3/generated/torchtune.modules.get_cosine_schedule_with_warmup.html) with [warmup](https://arxiv.org/pdf/1608.03983) Scheduler (`warmup_iters`) 
 - [ X ] Update the forward pass for a manual bool kwarg for `return_all_mtp_heads`. If `True` keep the stacked tensor, if `False` keep only one head. look at https://huggingface.co/facebook/multi-token-prediction/blob/main/llama/model.py
+
+Examples for training Transformers: 
+
+1. [NanoGPT](https://github.com/karpathy/nanoGPT/blob/master/train.py) by Andrej Karpathy (other [repo](https://github.com/karpathy/build-nanogpt/blob/master/train_gpt2.py) for the YT tutorial)
+
+2. [Delphi](https://github.com/delphi-suite/delphi/blob/main/delphi/train/training.py#L48) (also trains tokenizer with BPE similar to GPT-2 tokenizer)
+
+3. [OLMo 2](https://github.com/allenai/OLMo-core?tab=readme-ov-file) by Ai2 ([blog](https://allenai.org/blog/olmo2-32B)): public train script at https://github.com/allenai/OLMo-core/blob/main/src/scripts/official/OLMo-2-0325-32B-train.py
+
+4. [Transformer Birth](https://github.com/karpathy/nanoGPT/blob/master/train.py) paper

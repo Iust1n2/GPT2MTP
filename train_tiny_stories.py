@@ -31,27 +31,27 @@ logging.getLogger().setLevel(logging.INFO)
 class TrainingArgs: 
     model_config : GPT2MTPConfig
     dataset_config : DatasetConfig
-    data_dir : str = 'data/open_web_text/'  
-    save_dir : str = 'checkpoints/open_web_text/'
-    init_from : str = 'scratch' # or 'resume'
+    data_dir : str = 'data/tiny_stories_v2/'  
+    save_dir : str = 'checkpoints/tiny_stories_v2/'
+    init_from : str = 'resume' # or 'resume'
     always_save_checkpoint : bool = True
     eval_only : bool = False 
-    eval_interval : int = 400
-    eval_iters : int = 200
+    eval_interval : int = 400 // 4
+    eval_iters : int = 200 // 4
     eval_ngrams : bool = False
     n_future : int = 4
-    batch_size : int = 8 # gpt2 uses batch size of 512 for 1024 tokens in context
-    gradient_accumulation_steps : int = 128 # 2**19 tokens per step / (bsz=16 * block_size=256) = 128
-    max_iters : int = 10850 
-    lr_decay_iters : int = 10850
+    batch_size : int = 32 # gpt2 uses batch size of 512 for 1024 tokens in context
+    gradient_accumulation_steps : int = 32 # 2**19 tokens per step / (bsz=16 * block_size=256) = 128
+    max_iters : int = 2080 
+    lr_decay_iters : int = 2080
     max_lr : float = 3e-4 
     decay_lr : bool = True
-    warmup_steps : int = 1000
+    warmup_steps : int = 1000 // 20
     min_lr : float = 3e-5
-    weight_decay : float = 0.1 # reduce from 0.03 to 0.01 if residual stream gradients begin to vanish in deeper layers or overall smaller than mtp heads
-    betas : tuple = (0.9, 0.95)
+    weight_decay : float = 0.005 # reduce from 0.03 to 0.01 if residual stream gradients begin to vanish in deeper layers or overall smaller than mtp heads
+    betas : tuple = (0.9, 0.98)
     grad_clip : float = 1.0 # increase to 1.5 if mtp heads gradients start exploding
-    log_interval : int = 200
+    log_interval : int = 200 // 4
     device : str = 'cuda' 
     dtype : str = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
     compile : bool = True
@@ -59,8 +59,8 @@ class TrainingArgs:
 if __name__ == "__main__":
     os.environ['TOKENIZERS_PARALLELISM']='false'
     args = TrainingArgs(
-        model_config = GPT2MTPConfig(),
-        dataset_config = DatasetConfig(data_dir='data/open_web_text/', split='train'),
+        model_config = GPT2MTPConfig(n_ctx=256, n_layers=2, n_heads=4, d_model=256, d_mlp=1024, d_head=64),
+        dataset_config = DatasetConfig(data_dir='data/tiny_stories_v2/', split='train', batch_size=32, block_size=256),
     )
     logging.info(f"Training with args: {args}")
 
@@ -109,7 +109,7 @@ if __name__ == "__main__":
         model = GPT2MTP(config=args.model_config, n_future=args.n_future).to(args.model_config.device) 
         model.init_weights()
     elif args.init_from == 'resume':
-        ckpt_path = os.path.join(args.save_dir, 'checkpoint_step_800.pt') # Load a preferred checkpoint
+        ckpt_path = os.path.join(args.save_dir, 'checkpoint_step_1000.pt') # Load a preferred checkpoint
         logging.info(f"Resuming training from {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=args.model_config.device)
         model = GPT2MTP(config=args.model_config, n_future=args.n_future).to(args.model_config.device)
@@ -125,7 +125,8 @@ if __name__ == "__main__":
     # Optimizer and Scheduler
     optimizer = AdamW(model.parameters(), lr=args.max_lr, betas=args.betas, weight_decay=args.weight_decay)
     scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=args.max_iters)
-    scaler = GradScaler(enabled=(args.dtype == 'float16'))
+    # scaler = GradScaler(enabled=(args.dtype == 'float16'))
+    scaler = GradScaler(enabled=False)
     
     if args.init_from == 'resume':
         optimizer.load_state_dict(ckpt['optimizer'])
@@ -165,7 +166,8 @@ if __name__ == "__main__":
     # # Get the first batch
     X, y = train_dataset.get_batch('train') 
     logging.info("Entering training loop...")
-    # Training loop
+    # Training loop (train tokens / tokens_per_step = num of steps = 545002725 / 262144 ~ 2079)
+    # Time per step ~ 20s, 20s * 2079 steps / 60^2 = 11.5 hours 
     while step < args.max_iters:
         # Get the current learning rate (either restored or new)
         current_lr = optimizer.param_groups[0]['lr']
@@ -177,7 +179,8 @@ if __name__ == "__main__":
             cache = model.add_caching_hooks(names_filter=all_hook_names, incl_bwd=True) 
             grads_for_vis = [
                 re.compile(r'^(hook_mtp_heads)\.(\d+)_grad$'),
-                re.compile(r'^(blocks\.(\d+)\.hook_resid_post)_grad$')
+                re.compile(r'^(blocks\.(\d+)\.hook_resid_post)_grad$'),
+                re.compile(r'^(blocks\.(\d+)\.hook_resid_mid)_grad$')
             ]
         # Evaluate the loss on train/val sets and write checkpoints
         if step % args.eval_interval == 0:
@@ -192,8 +195,8 @@ if __name__ == "__main__":
         if step == 0 and args.eval_only:
             break
         
-        # Gradient accumulation loop 16 (batch_size) * (64) (gradient_accumulation_steps) = 1024 effective batch_size per optimizer step 
-        # tokens per effective batch = 524,288
+        # Gradient accumulation loop 32 (batch_size) * (32) (gradient_accumulation_steps) = 1024 effective batch_size per optimizer step 
+        # tokens per effective batch = 262,144
         total_loss_accum = 0.0
         logging.info(f"Entering gradient accumulation loop for step {step}")
         for micro_step in range(args.gradient_accumulation_steps):
@@ -203,13 +206,13 @@ if __name__ == "__main__":
     
             # Save token history:
             token_history.extend(X.flatten().tolist())
-            
+
             if args.init_from == 'resume':
                 total_tokens_seen = tokens_seen + len(token_history)
             
             else: 
                 total_tokens_seen = len(token_history)
-
+            
             # We subtract n_future from the sequence length to match the causal MTP setting 
             prompt_len = X.shape[1] - model.n_future 
 
@@ -295,13 +298,13 @@ if __name__ == "__main__":
         t1 = time.time()
         dt = t1 - t0
         t0 = t1
-
+ 
         average_loss_per_token = total_loss_accum / model.n_future
         # Log final loss
         if step % args.log_interval == 0:
             # unscale loss for logging
             # loss_value = total_loss.item() * args.gradient_accumulation_steps / model.n_future
-            logging.info(f"Step {step}: Loss {average_loss_per_token:.2f}, Norm: {norm:.4f}, Time: {dt:.2f}s, Tokens Seen: {total_tokens_seen / 1e6:.1f}M") 
+            logging.info(f"Step {step}: Loss {average_loss_per_token:.2f}, Norm: {norm:.4f}, Time: {dt:.2f}s, Tokens Seen: {total_tokens_seen/ 1e6:.1f}M") 
         
         curr_history = {
                 'step': step,

@@ -12,7 +12,7 @@ import random
 class GPT2MTPConfig():
     """Configuration for GPT2MTP model."""
     d_vocab: int = 50257
-    n_ctx: int = 256 # block_size + n_future ≤ max_context_length (1024 for all GPT-2's // 8)
+    n_ctx: int = 512 # block_size + n_future ≤ max_context_length (1024 for all GPT-2's // 8)
     n_layers: int = 12
     n_heads: int = 12
     d_model: int = 768

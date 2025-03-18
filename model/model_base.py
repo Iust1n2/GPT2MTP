@@ -8,7 +8,7 @@ from jaxtyping import Float, Int
 import os
 import numpy as np
 import torch
-from typing import Dict, List, NamedTuple, Optional, Tuple, Union, overload
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union, Callable, Sequence, overload
 from typing_extensions import Literal
 
 from torch import nn
@@ -49,6 +49,7 @@ USE_DEFAULT_VALUE = None
 SingleLoss = Float[torch.Tensor, ""]  # Type alias for a single element tensor
 LossPerToken = Float[torch.Tensor, "batch pos-1"]
 Loss = Union[SingleLoss, LossPerToken]
+NamesFilter = Optional[Union[Callable[[str], bool], Sequence[str], str]]
 
 class Output(NamedTuple):
     """Output Named Tuple.
@@ -671,7 +672,7 @@ class GPT2MTP(HookedRootModule):
             # Ensure all biases are explicitly set to 0.0
             elif "b_" in name or "bias" in name:
                 nn.init.constant_(param, 0.0)
-        
+
     @overload
     def run_with_cache(
         self, *model_args, return_cache_object: Literal[True] = True, **kwargs
