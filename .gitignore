@@ -1,12 +1,15 @@
+delphi-mtp.md
 tlens_backup/*
 train/train_misc/*
 checkpoints/*
+checkpoints_delphi/*
 notebooks/*
 OWT.md
 data/open_web_text_10k/*
 data/open_web_text/*
 data/tiny_shakespeare/*
 data/tiny_stories_v2/*
+data/delphi_stories/*
 data/__pycache__/*
 model/__pycache__/*
 train/__pycache__/*

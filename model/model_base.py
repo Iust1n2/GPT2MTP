@@ -244,7 +244,7 @@ class GPT2MTP(HookedRootModule):
             Float[torch.Tensor, "batch pos d_model"],
         ],
         targets: Optional[Int[torch.Tensor, "batch pos + n_future"]] = None,
-        return_type: Optional[str] = "logits",
+        return_type: Optional[Literal["logits", "loss", "both"]] = "logits",
         return_all_heads: bool = True,
         loss_type: Optional[Literal["multi_token", "single_token"]] = "multi_token",
         loss_per_token: bool = False,
@@ -329,6 +329,10 @@ class GPT2MTP(HookedRootModule):
             assert (
                 tokens is not None
             ), "tokens must be passed in if return_type is 'loss' or 'both'"
+            if targets is None: 
+                # TODO: test shapes match for CE loss
+                # Left shift the input to the right
+                targets = tokens[:, 1:]
             if loss_type == "multi_token":
                 loss = self.loss_fn(logits, targets, attention_mask, per_token=loss_per_token, loss_type=loss_type)
             elif loss_type == "single_token": 
@@ -355,9 +359,9 @@ class GPT2MTP(HookedRootModule):
         """    
         targets = targets.to(logits.device)
         if loss_type == "single_token":
-            return lm_cross_entropy_loss(logits, targets, attention_mask, per_token)
+            return lm_cross_entropy_loss(logits, targets, attention_mask, per_token, self.tokenizer.pad_token_id)
         elif loss_type == "multi_token":
-            return mtp_cross_entropy_loss(logits, targets, attention_mask, per_token)
+            return mtp_cross_entropy_loss(logits, targets, attention_mask, per_token, self.tokenizer.pad_token_id)
         
     
     def input_to_embed(
@@ -394,6 +398,7 @@ class GPT2MTP(HookedRootModule):
             ), "Must provide a tokenizer if passing a string to the model"
             # This is only intended to support passing in a single string
             tokens = self.to_tokens(input, prepend_bos=prepend_bos, padding_side=padding_side)
+            print(f"After to_tokens: tokens.dtype={tokens.dtype}, tokens.device={tokens.device}")
         else:
             tokens = input
         if len(tokens.shape) == 1:

@@ -41,10 +41,10 @@ class GPT2MTPConfig():
     default_prepend_bos: bool = True
     device: Optional[str] = 'cuda' if torch.cuda.is_available() else 'cpu'
     n_devices: int = 1
-    iniitalizer_range: float = -1.0
+    initializer_range: float = -1.0
 
     def __post_init__(self):
-        if self.iniitalizer_range < 0:
+        if self.initializer_range < 0:
             # Roughly copy the GPT-2 value, but proportional to sqrt(1/d_model)
             self.initializer_range = 0.8 / np.sqrt(self.d_model)
         if self.device is None:

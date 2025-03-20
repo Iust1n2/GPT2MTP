@@ -1,3 +1,6 @@
 [submodule "TransformerLens"]
 	path = TransformerLens
 	url = https://github.com/Iust1n2/TransformerLens
+[submodule "delphi"]
+	path = delphi
+	url = git@github.com:Iust1n2/delphi.git

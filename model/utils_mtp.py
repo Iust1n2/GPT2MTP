@@ -78,17 +78,17 @@ def apply_causal_mask(
             einsum_str = "batch head pos offset_pos, batch offset_pos -> batch head pos offset_pos"
             final_mask = final_mask.to(attention_mask.device)
             final_mask = einops.einsum(final_mask, attention_mask, einsum_str).bool()
-
-        attn_scores = attn_scores.to(final_mask.device)
+        attn_scores = attn_scores.to(final_mask.device) 
         ignore_val = torch.tensor(-1e4, dtype=attn_scores.dtype, device=attn_scores.device)
         return torch.where(final_mask, attn_scores, ignore_val)
 
-# taken from transformer_lens.utils
+
 def lm_cross_entropy_loss(
     logits: Float[torch.Tensor, "batch pos d_vocab"],
-    tokens: Int[torch.Tensor, "batch pos"],
+    targets: Int[torch.Tensor, "batch pos"],
     attention_mask: Optional[Int[torch.Tensor, "batch pos"]] = None,
     per_token: bool = False,
+    pad_token_id: Optional[int] = None,
 ) -> Union[Float[torch.Tensor, ""], Float[torch.Tensor, "batch pos"]]:
     """Cross entropy loss for the language model, gives the loss for predicting the NEXT token.
 
@@ -98,26 +98,35 @@ def lm_cross_entropy_loss(
         attention_mask (torch.Tensor[int64], optional): Attention mask. Shape [batch, pos]. Used to
             mask out padding tokens. Defaults to None.
         per_token (bool, optional): Whether to return the log probs predicted for the correct token, or the loss (ie mean of the predicted log probs). Note that the returned array has shape [batch, seq-1] as we cannot predict the first token (alternately, we ignore the final logit). Defaults to False.
-    """
-    log_probs = F.log_softmax(logits, dim=-1)
-    # Use torch.gather to find the log probs of the correct tokens
-    # Offsets needed because we're predicting the NEXT token (this means the final logit is meaningless)
-    # None and [..., 0] needed because the tensor used in gather must have the same rank.
-    predicted_log_probs = log_probs[..., :-1, :].gather(dim=-1, index=tokens[..., 1:, None])[..., 0]
+        pad_token_id (int, optional): Padding token id to ingore in the loss computation. Defaults to None.
+    """        
+    if logits.dim() == 4 and logits.size(2) == 1:
+        logits = logits.squeeze(2)  # Now shape: [batch, pos, d_vocab]
 
+    # Extract the logits for the next token
+    logits_last = logits[:, :-1, :]  # shape: [batch, pos-1, d_vocab]
+
+    # Flatten for cross_entropy: logits_i becomes (batch*pos, d_vocab) and targets_i becomes (batch*pos)
+    logits_flat = logits_last.reshape(-1, logits_last.size(-1))
+    targets_flat = targets.reshape(-1)
+
+    # Compute per-token cross-entropy loss.
+    loss = F.cross_entropy(logits_flat, targets_flat, ignore_index=pad_token_id)  # shape: (batch*pos)
+        
+    # If an attention mask is provided, apply it.
     if attention_mask is not None:
-        # Ignore token positions which are masked out or where the next token is masked out
-        # (generally padding tokens)
-        next_token_mask = torch.logical_and(attention_mask[:, :-1], attention_mask[:, 1:])
-        predicted_log_probs *= next_token_mask
-        n_tokens = next_token_mask.sum().item()
+        loss = loss * attention_mask  # zeros out loss where attention_mask==0
+        if not per_token:
+            # Average only over non-masked tokens.
+            loss = loss.sum() / attention_mask.sum()
+            return loss
+        else:
+            return loss
     else:
-        n_tokens = predicted_log_probs.numel()
-
-    if per_token:
-        return -predicted_log_probs
-    else:
-        return -predicted_log_probs.sum() / n_tokens
+        if not per_token:
+            return loss.mean()
+        else:
+            return loss
 
 
 def mtp_cross_entropy_loss(
@@ -125,6 +134,7 @@ def mtp_cross_entropy_loss(
     targets: torch.Tensor,   # shape: (batch, pos + n_future)
     attention_mask: Optional[torch.Tensor] = None,  # shape: (batch, pos + n_future)
     per_token: bool = False,
+    pad_token_id: int = None,
 ) -> Union[torch.Tensor, torch.Tensor]:
     """
     Multi-token prediction cross-entropy loss for targets that are shifted by n_future positions.
@@ -141,7 +151,7 @@ def mtp_cross_entropy_loss(
         attention_mask (torch.Tensor, optional): Mask of shape (batch, pos + n_future) where positions with 0 (or False)
             are ignored.
         per_token (bool, optional): If True, return per-token losses as a tensor; otherwise, return the average loss.
-    
+        pad_token_id (int, optional): EOT token to ignore in the loss computation.
     Returns:
         Either a scalar loss (if per_token is False) or a tensor of per-token losses.
     """
@@ -170,7 +180,7 @@ def mtp_cross_entropy_loss(
         targets_i_flat = targets_i.reshape(-1)
 
         # Compute per-token cross-entropy loss with no reduction.
-        loss_i = F.cross_entropy(logits_i_flat, targets_i_flat, reduction="none")  # shape: (batch*pos)
+        loss_i = F.cross_entropy(logits_i_flat, targets_i_flat, ignore_index=pad_token_id)  # shape: (batch*pos)
         
         if attention_mask is not None:
             # Construct masks for context and target positions.

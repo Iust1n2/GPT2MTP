@@ -22,7 +22,8 @@ from train.utils import (
     save_checkpoint,
     plot_grad_flow, 
     log_acts_and_grads,
-    compute_ngram_accuracy
+    compute_ngram_accuracy,
+    generate_text
 )
 
 logging.getLogger().setLevel(logging.INFO)
@@ -31,8 +32,8 @@ logging.getLogger().setLevel(logging.INFO)
 class TrainingArgs: 
     model_config : GPT2MTPConfig
     dataset_config : DatasetConfig
-    data_dir : str = 'data/tiny_stories_v2/'  
-    save_dir : str = 'checkpoints/tiny_stories_v2/'
+    data_dir : str = 'data/delphi_stories/'  
+    save_dir : str = 'checkpoints/delphi_stories/'
     init_from : str = 'resume' # or 'resume'
     always_save_checkpoint : bool = True
     eval_only : bool = False 
@@ -48,8 +49,8 @@ class TrainingArgs:
     decay_lr : bool = True
     warmup_steps : int = 1000 // 20
     min_lr : float = 3e-5
-    weight_decay : float = 0.005 # reduce from 0.03 to 0.01 if residual stream gradients begin to vanish in deeper layers or overall smaller than mtp heads
-    betas : tuple = (0.9, 0.98)
+    weight_decay : float = 0.1 # reduce from 0.03 to 0.01 if residual stream gradients begin to vanish in deeper layers or overall smaller than mtp heads
+    betas : tuple = (0.9, 0.95)
     grad_clip : float = 1.0 # increase to 1.5 if mtp heads gradients start exploding
     log_interval : int = 200 // 4
     device : str = 'cuda' 
@@ -59,8 +60,8 @@ class TrainingArgs:
 if __name__ == "__main__":
     os.environ['TOKENIZERS_PARALLELISM']='false'
     args = TrainingArgs(
-        model_config = GPT2MTPConfig(n_ctx=256, n_layers=2, n_heads=4, d_model=256, d_mlp=1024, d_head=64),
-        dataset_config = DatasetConfig(data_dir='data/tiny_stories_v2/', split='train', batch_size=32, block_size=256),
+        model_config = GPT2MTPConfig(n_ctx=256, n_layers=2, n_heads=4, d_model=256, d_mlp=1024, d_head=64, tokenizer_name='delphi-suite/stories-tokenizer'),
+        dataset_config = DatasetConfig(data_dir='data/delphi_stories/', split='train', batch_size=32, block_size=256),
     )
     logging.info(f"Training with args: {args}")
 
@@ -148,9 +149,9 @@ if __name__ == "__main__":
         for split in ['train', 'val']:
             losses = torch.zeros(args.eval_iters)
             for k in range(args.eval_iters):
-                    X, Y = train_dataset.get_batch(split)
+                    X, _ = train_dataset.get_batch(split)
                     with ctx:
-                        loss = model(X, Y, return_type='loss')  
+                        loss = model(X, targets=None, return_type='loss', return_all_heads=False, loss_type='single_token')
                     losses[k] = loss.item()
             out[split] = losses.mean()
         model.train()
@@ -187,6 +188,7 @@ if __name__ == "__main__":
             losses = estimate_loss()
             tokens_seen_per_eval_step = args.batch_size * args.dataset_config.block_size * args.eval_interval
             logging.info(f"Eval Step {step} across {args.eval_iters} batches ({tokens_seen_per_eval_step / 1e6:.1f}M Tokens): Train Loss {losses['train']:.4f}, Val Loss {losses['val']:.4f}")
+            logging.info(f"Generating text: \n{generate_text(model, args.device, ctx)}")
             if losses['val'] < best_val_loss or args.always_save_checkpoint:
                 best_val_loss = losses['val']
                 save_checkpoint(args.save_dir, model, optimizer, scheduler, step, best_val_loss, history, cache)
@@ -235,14 +237,14 @@ if __name__ == "__main__":
                     head_logits = model.unembed(mtp_resid_post)   # (batch, seq_length, vocab_size)
 
                     # Align logits and targets for causal prediction
-                    logits_i = head_logits[:, prompt_len - 1 + i, :]  # Predict token at (prompt_len + i)
-                    targets_i = y[:, prompt_len + i]
+                    logits_i = head_logits[:, prompt_len + i, :]  # Predicting token at (n_future - i)
+                    targets_i = y[:, -model.n_future + i]  
 
                     # 5. Compute cross-entropy loss per head
                     loss_i = F.cross_entropy(
                         logits_i.reshape(-1, logits_i.size(-1)),  # (batch * valid_length, vocab_size)
                         targets_i.reshape(-1),                    # (batch * valid_length)
-                        # ignore_index=-1                           # Ignore padding if used
+                        ignore_index=model.tokenizer.pad_token_id # Ignore padding token
                     )
                 # End autocast before the backward pass
                 # scale the loss to account for gradient accumulation
@@ -259,7 +261,7 @@ if __name__ == "__main__":
                 if d.grad is not None:
                     grad_norm = d.grad.norm().item()
                     if micro_step % args.gradient_accumulation_steps == 0:
-                        logging.info(f"Final Micro-step {micro_step + args.gradient_accumulation_steps}, Gradient norm for MTP head {i + 1}: {grad_norm:.4f}, Head Loss: {loss_i_scaled.item():.4f}")
+                        logging.info(f"Final Micro-step {micro_step + args.gradient_accumulation_steps}, Gradient norm for MTP head {i + 1}: {grad_norm:.4f}, Head Loss: {loss_i.item():.4f}")
                 else:
                     print(f"Warning: d.grad is None after backward pass of head {i + 1}")
                 # Free memory
@@ -358,5 +360,5 @@ if __name__ == "__main__":
     
         step += 1
     # Save final checkpoint
-    save_checkpoint(model, optimizer, scheduler, step, args.save_dir, history, cache)
+    save_checkpoint(args.save_dir, model, optimizer, scheduler, step, best_val_loss, history, cache)
     logging.info(f"Training complete in {dt:.2f} seconds.") 
