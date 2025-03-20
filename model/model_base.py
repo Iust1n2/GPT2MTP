@@ -308,20 +308,28 @@ class GPT2MTP(HookedRootModule):
             # We retrieve the shared trunk output from the final block before the MTP heads start.
             return residual
         
-        # MTP Prediction Heads
+        # Causal MTP forward pass
+        # Start with the transformer residual stream.
+        # 'residual' is the output of the final transformer block.
+        h = residual 
+
+        chained_outputs = []
         n_mtp_heads = self.n_future if return_all_heads else 1
-        # if self.mtp_heads is not None and return_all_heads:
-        mtp_outputs = []
-        # Compute outputs for each of the n_future MTP heads.
+        # Chain the heads: each head processes the output from the previous one.
         for i, head in enumerate(self.mtp_heads[:n_mtp_heads]):
-            mtp_head = self.hook_mtp_heads[i](head(residual))
-            mtp_outputs.append(mtp_head)    
-        # Stack the outputs along a new dimension (n_future)
-        stacked_pre = self.hook_mtp_heads_out_pre(torch.stack(mtp_outputs, dim=-2))  # (batch, pos, n_future, d_model)
-        # Pass the stacked tensor through a LayerNorm.
-        stacked_norm = self.hook_mtp_heads_out_post(self.ln_f(stacked_pre))  # (batch, pos, n_future, d_model)
-        # Map the hooked output to vocabulary logits using the shared unembedding layer
-        logits = self.hook_unembed(self.unembed(stacked_norm))  # Shape: (batch, seq, n_future, vocab_size)
+            # Apply the i-th MTP head to the previous output (ie forward it)
+            h = self.hook_mtp_heads[i](head(h)) 
+            chained_outputs.append(h)
+
+        # Stack the outputs along a new dimension representing the chain order.
+        stacked_pre = self.hook_mtp_heads_out_pre(torch.stack(chained_outputs, dim=-2)) # Shape: (batch, pos, n_future, d_model)
+
+        # Optionally, apply a LayerNorm and an output hook.
+        stacked_norm = self.hook_mtp_heads_out_post(self.ln_f(stacked_pre))
+
+        # Map the chained outputs to vocabulary logits using the shared unembedding layer.
+        logits = self.hook_unembed(self.unembed(stacked_norm))
+
         # Compute cross-entropy loss for each future token prediction.
         if return_type == "logits":
                 return logits
