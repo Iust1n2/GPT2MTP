@@ -28,7 +28,7 @@ class GPT2MTPConfig():
     dtype: str = torch.float32
     post_embedding_ln: bool = False
     act_function: str = "gelu"
-    rotary_adjacent_pairs: bool = False
+    rotary_adjacent_pairs: bool = True
     rotary_dim: Optional[int] = 64
     rotary_base: int = 10000
     use_NTK_by_parts_rope: bool = False

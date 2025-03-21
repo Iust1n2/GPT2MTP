@@ -27,7 +27,7 @@ class OpenWebTextDataset(Dataset):
         """
         self.args = args
         self.batch_size = args.batch_size
-        self.block_size = args.block_size - args.n_future
+        self.block_size = args.block_size
         assert split in ['train', 'val'], "split must be 'train' or 'val'"
         assert self.args.n_future >= 1, "n_future must be at least 1"
 

@@ -32,7 +32,7 @@ logging.getLogger().setLevel(logging.INFO)
 class TrainingArgs: 
     model_config : GPT2MTPConfig
     dataset_config : DatasetConfig
-    data_dir : str = 'data/delphi_stories/'  
+    # data_dir : str = 'data/delphi_stories/'  
     save_dir : str = 'checkpoints/delphi_stories/'
     init_from : str = 'scratch' # or 'resume'
     always_save_checkpoint : bool = True
@@ -41,8 +41,8 @@ class TrainingArgs:
     eval_iters : int = 200 // 4
     eval_ngrams : bool = False
     n_future : int = 4
-    batch_size : int = 32 # gpt2 uses batch size of 512 for 1024 tokens in context
-    gradient_accumulation_steps : int = 32 # 2**19 tokens per step / (bsz=16 * block_size=256) = 128
+    batch_size : int = 16 # gpt2 uses batch size of 512 for 1024 tokens in context
+    gradient_accumulation_steps : int = 64 # 2**19 tokens per step / (bsz=16 * block_size=256) = 128
     max_iters : int = 2080 
     lr_decay_iters : int = 2080
     max_lr : float = 3e-4 
@@ -60,8 +60,8 @@ class TrainingArgs:
 if __name__ == "__main__":
     os.environ['TOKENIZERS_PARALLELISM']='false'
     args = TrainingArgs(
-        model_config = GPT2MTPConfig(n_ctx=256, n_layers=2, n_heads=4, d_model=256, d_mlp=1024, d_head=64, tokenizer_name='delphi-suite/stories-tokenizer'),
-        dataset_config = DatasetConfig(data_dir='data/delphi_stories/', split='train', batch_size=32, block_size=256),
+        model_config = GPT2MTPConfig(n_ctx=512, n_layers=2, n_heads=4, d_model=256, d_mlp=1024, d_head=64, tokenizer_name='delphi-suite/stories-tokenizer'),
+        dataset_config = DatasetConfig(data_dir='data/delphi_stories/', split='train', batch_size=16, block_size=512),
     )
     logging.info(f"Training with args: {args}")
 
@@ -79,8 +79,6 @@ if __name__ == "__main__":
 
     # Load dataset
     train_dataset = OpenWebTextDataset(args.dataset_config, split='train')
-    train_loader = OpenWebTextDataset.get_dataloader(args.dataset_config, split='train')
-    val_loader = OpenWebTextDataset.get_dataloader(args.dataset_config, split='val')
 
     # Config of I/O precision
     torch.manual_seed(42)
@@ -164,7 +162,7 @@ if __name__ == "__main__":
         tokens_seen = history[-1]['tokens_seen']
         
     # # Get the first batch
-    X, y = train_dataset.get_batch('train') 
+    X, y = train_dataset.get_batch('train')
     logging.info("Entering training loop...")
     # Training loop (train tokens / tokens_per_step = num of steps = 545002725 / 262144 ~ 2079)
     # Time per step ~ 20s, 20s * 2079 steps / 60^2 = 11.5 hours 
@@ -187,7 +185,7 @@ if __name__ == "__main__":
             losses = estimate_loss()
             tokens_seen_per_eval_step = args.batch_size * args.dataset_config.block_size * args.eval_interval
             logging.info(f"Eval Step {step} across {args.eval_iters} batches ({tokens_seen_per_eval_step / 1e6:.1f}M Tokens): Train Loss {losses['train']:.4f}, Val Loss {losses['val']:.4f}")
-            logging.info(f"Generating text: \n{generate_text(model, args.device, ctx)}")
+            logging.info(f"Generating text: \n{generate_text(model, args.device, ctx, max_length=124)}")
             if losses['val'] < best_val_loss or args.always_save_checkpoint:
                 best_val_loss = losses['val']
                 save_checkpoint(args.save_dir, model, optimizer, scheduler, step, best_val_loss, history, cache)
@@ -214,7 +212,9 @@ if __name__ == "__main__":
             # 1) Forward pass through the shared trunk
             #    shape: (batch, seq_len, d_model)
             with ctx: 
-                trunk_out = model.shared_trunk(X)
+                prompt_len = X.size(1) - args.n_future  # For example, if block_size is 512 and n_future is 4, prompt_len becomes 508.
+                prompt = X[:, :prompt_len]              # The trunk sees only the prompt tokens.
+                trunk_out = model.shared_trunk(prompt)
 
             # 2) "Chained" forward pass through each MTP head in order
             #    We store each head's output so we can do backward in reverse
@@ -241,8 +241,7 @@ if __name__ == "__main__":
 
                     # We want the token at position (prompt_len + i)
                     # i.e. the i-th future token in the sequence
-                    prompt_len = X.size(1) - args.n_future
-                    pred_logits = logits_i[:, prompt_len + i, :]  # (B, vocab_size)
+                    pred_logits = logits_i[:, -1, :]  # (B, vocab_size)
                     target = y[:, prompt_len + i]                 # (B,)
 
                     # Calculate the loss for head i
@@ -267,7 +266,8 @@ if __name__ == "__main__":
         del chained, trunk_out
         gc.collect()
         torch.cuda.empty_cache()
-        
+        # Get the next batch
+        X, y = train_dataset.get_batch('train')  
         t1 = time.time()
         dt1 = t1 - t0
         logging.info(f"Step {step} | Total Loss: {total_loss.item():.2f} | Average Loss: {total_loss.item() / args.n_future:.2f} | Time: {dt1:.2f}s")
@@ -308,7 +308,7 @@ if __name__ == "__main__":
                 
             # Compute n-gram accuracies
             with torch.no_grad():
-                logits = model.forward(X)[:, -1, :, :]  # (batch, n_future, vocab_size)
+                logits = model.forward(X[:, :prompt_len])[:, -1, :, :]  # (batch, n_future, vocab_size)
                 pred_token_ids = torch.argmax(logits, dim=-1)  # (batch, n_future)
                 predicted_future_toks = [model.tokenizer.batch_decode(tok_seq) for tok_seq in pred_token_ids]
                 target_future_toks = [model.tokenizer.batch_decode(tgt_seq[:args.n_future]) for tgt_seq in y]

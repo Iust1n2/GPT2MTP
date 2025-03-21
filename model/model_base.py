@@ -243,7 +243,7 @@ class GPT2MTP(HookedRootModule):
             Int[torch.Tensor, "batch pos"],
             Float[torch.Tensor, "batch pos d_model"],
         ],
-        targets: Optional[Int[torch.Tensor, "batch pos + n_future"]] = None,
+        targets: Optional[Int[torch.Tensor, "batch pos"]] = None,
         return_type: Optional[Literal["logits", "loss", "both"]] = "logits",
         return_all_heads: bool = True,
         loss_type: Optional[Literal["multi_token", "single_token"]] = "multi_token",
